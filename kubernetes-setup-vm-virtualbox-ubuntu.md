@@ -4836,3 +4836,801 @@ kubectl logs -n fastapi -l app=fastapi --tail=20
 3. **Add monitoring** (Prometheus/Grafana)
 
 **If any pods fail, send:** `kubectl describe pod <pod-name> -n <namespace>`
+
+#!/bin/bash
+# Complete Cloud Native Setup Script
+# This will set up a production-like Kubernetes environment with CNCF graduated projects
+
+set -e
+
+echo "=========================================="
+echo "Cloud Native Infrastructure Setup"
+echo "=========================================="
+
+# Color codes for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+# Function to print colored messages
+print_status() {
+    echo -e "${GREEN}[✓]${NC} $1"
+}
+
+print_error() {
+    echo -e "${RED}[✗]${NC} $1"
+}
+
+print_warning() {
+    echo -e "${YELLOW}[!]${NC} $1"
+}
+
+# Step 1: Clean up any existing Kubernetes installation
+echo ""
+echo "Step 1: Cleaning up existing installation..."
+if command -v kubeadm &> /dev/null; then
+    sudo kubeadm reset -f 2>/dev/null || true
+fi
+sudo rm -rf /etc/cni/net.d
+sudo rm -rf $HOME/.kube/config
+sudo iptables -F && sudo iptables -t nat -F && sudo iptables -t mangle -F && sudo iptables -X
+docker system prune -af --volumes 2>/dev/null || true
+print_status "Cleanup completed"
+
+# Step 2: Install Container Runtime (containerd)
+echo ""
+echo "Step 2: Installing containerd..."
+sudo apt-get update
+sudo apt-get install -y containerd
+
+sudo mkdir -p /etc/containerd
+containerd config default | sudo tee /etc/containerd/config.toml > /dev/null
+sudo sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+
+sudo systemctl restart containerd
+sudo systemctl enable containerd
+print_status "containerd installed and configured"
+
+# Step 3: Configure System
+echo ""
+echo "Step 3: Configuring system for Kubernetes..."
+
+# Disable swap
+sudo swapoff -a
+sudo sed -i '/ swap / s/^\(.*\)$/#\1/g' /etc/fstab
+
+# Load kernel modules
+cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+sudo modprobe overlay
+sudo modprobe br_netfilter
+
+# Configure sysctl
+cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+EOF
+
+sudo sysctl --system
+print_status "System configured"
+
+# Step 4: Install Kubernetes components
+echo ""
+echo "Step 4: Installing Kubernetes components..."
+
+sudo mkdir -p /etc/apt/keyrings
+curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.28/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.28/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.list
+
+sudo apt-get update
+sudo apt-get install -y kubelet kubeadm kubectl
+sudo apt-mark hold kubelet kubeadm kubectl
+sudo systemctl enable --now kubelet
+print_status "Kubernetes components installed"
+
+# Step 5: Initialize Kubernetes cluster
+echo ""
+echo "Step 5: Initializing Kubernetes cluster..."
+sudo kubeadm init \
+  --pod-network-cidr=10.244.0.0/16 \
+  --skip-phases=addon/kube-proxy \
+  --cri-socket=unix:///run/containerd/containerd.sock
+
+mkdir -p $HOME/.kube
+sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+kubectl taint nodes --all node-role.kubernetes.io/control-plane-
+print_status "Kubernetes cluster initialized"
+
+# Step 6: Install Cilium (CNCF Graduated - CNI with eBPF)
+echo ""
+echo "Step 6: Installing Cilium CNI..."
+
+CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/main/stable.txt)
+CLI_ARCH=amd64
+curl -L --fail --remote-name-all https://github.com/cilium/cilium-cli/releases/download/${CILIUM_CLI_VERSION}/cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+sha256sum --check cilium-linux-${CLI_ARCH}.tar.gz.sha256sum
+sudo tar xzvfC cilium-linux-${CLI_ARCH}.tar.gz /usr/local/bin
+rm cilium-linux-${CLI_ARCH}.tar.gz{,.sha256sum}
+
+cilium install --version 1.14.5 \
+  --set kubeProxyReplacement=strict \
+  --set hubble.enabled=true \
+  --set hubble.relay.enabled=true \
+  --set hubble.ui.enabled=true \
+  --set prometheus.enabled=true \
+  --set operator.prometheus.enabled=true
+
+cilium status --wait
+print_status "Cilium installed"
+
+# Step 7: Install Helm (Package Manager)
+echo ""
+echo "Step 7: Installing Helm..."
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+print_status "Helm installed"
+
+# Step 8: Setup Local Docker Registry
+echo ""
+echo "Step 8: Setting up local Docker registry..."
+docker run -d -p 5000:5000 --restart=always --name registry registry:2
+
+sudo mkdir -p /etc/containerd/certs.d/localhost:5000
+cat <<EOF | sudo tee /etc/containerd/certs.d/localhost:5000/hosts.toml
+[host."http://localhost:5000"]
+  capabilities = ["pull", "resolve", "push"]
+  skip_verify = true
+EOF
+
+sudo systemctl restart containerd
+print_status "Local Docker registry configured"
+
+# Step 9: Install CoreDNS (Already included in kubeadm)
+print_status "CoreDNS already installed with kubeadm"
+
+# Step 10: Install etcd (Already included in kubeadm)
+print_status "etcd already installed with kubeadm"
+
+echo ""
+echo "=========================================="
+echo "Base Installation Complete!"
+echo "=========================================="
+echo ""
+echo "Installed CNCF Graduated Projects:"
+echo "  ✓ Kubernetes (Container Orchestration)"
+echo "  ✓ containerd (Container Runtime)"
+echo "  ✓ CoreDNS (Service Discovery)"
+echo "  ✓ etcd (Distributed Key-Value Store)"
+echo "  ✓ Cilium (CNI with eBPF)"
+echo "  ✓ Helm (Package Manager)"
+echo ""
+echo "Next steps:"
+echo "  1. Run: kubectl get nodes (should show Ready)"
+echo "  2. Run: kubectl get pods -A (all pods should be Running)"
+echo "  3. Run: cilium status"
+echo ""
+echo "Ready to deploy applications!"
+
+#!/bin/bash
+# Install Prometheus Operator Stack (CNCF Graduated)
+# This includes: Prometheus, Grafana, Alertmanager, and related components
+
+set -e
+
+echo "Installing Prometheus Operator Stack..."
+
+# Add Helm repository
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# Create monitoring namespace
+kubectl create namespace monitoring
+
+# Install kube-prometheus-stack
+helm install prometheus prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --set prometheus.prometheusSpec.retention=7d \
+  --set prometheus.prometheusSpec.storageSpec.volumeClaimTemplate.spec.resources.requests.storage=20Gi \
+  --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+  --set grafana.adminPassword=admin123 \
+  --set grafana.service.type=NodePort \
+  --set grafana.service.nodePort=30000 \
+  --set alertmanager.enabled=true \
+  --set alertmanager.alertmanagerSpec.storage.volumeClaimTemplate.spec.resources.requests.storage=5Gi
+
+echo "Waiting for Prometheus Operator to be ready..."
+kubectl wait --for=condition=ready pod -l app.kubernetes.io/name=prometheus -n monitoring --timeout=300s
+
+# Create ServiceMonitor for our applications
+cat <<EOF | kubectl apply -f -
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: django-apps
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: django-app1
+  namespaceSelector:
+    matchNames:
+    - apps
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: fastapi-apps
+  namespace: monitoring
+  labels:
+    release: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: fastapi-app1
+  namespaceSelector:
+    matchNames:
+    - apps
+  endpoints:
+  - port: http
+    path: /metrics
+    interval: 30s
+EOF
+
+# Get Grafana URL
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+echo ""
+echo "=========================================="
+echo "Prometheus Stack Installed!"
+echo "=========================================="
+echo ""
+echo "Access Grafana at: http://${NODE_IP}:30000"
+echo "Username: admin"
+echo "Password: admin123"
+echo ""
+echo "Prometheus UI: kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090"
+echo "Then access: http://localhost:9090"
+echo ""
+
+# Create Grafana Dashboard ConfigMap for our apps
+cat <<EOF | kubectl apply -f -
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: app-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  app-dashboard.json: |
+    {
+      "dashboard": {
+        "title": "Application Metrics",
+        "panels": [
+          {
+            "title": "HTTP Requests Rate",
+            "targets": [
+              {
+                "expr": "rate(http_requests_total[5m])"
+              }
+            ]
+          },
+          {
+            "title": "Response Time",
+            "targets": [
+              {
+                "expr": "http_request_duration_seconds"
+              }
+            ]
+          }
+        ]
+      }
+    }
+EOF
+
+echo "ServiceMonitors created for application monitoring"
+echo "Import dashboard ID 6417 in Grafana for Kubernetes Pod metrics"
+echo "Import dashboard ID 15759 for Node Exporter metrics"
+
+# Complete Cloud Native Setup Guide
+
+## Overview
+
+This guide sets up a production-like Kubernetes environment with:
+- **2 Django Applications** connected to PostgreSQL
+- **2 FastAPI Applications** connected to PostgreSQL
+- **CNCF Graduated Projects**: Kubernetes, containerd, Cilium, CoreDNS, etcd, Prometheus, Helm
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Kubernetes Cluster                    │
+├─────────────────────────────────────────────────────────┤
+│                                                           │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │              Namespace: apps                      │  │
+│  │                                                    │  │
+│  │  ┌─────────────┐  ┌─────────────┐               │  │
+│  │  │ Django App1 │  │ Django App2 │               │  │
+│  │  │  (2 pods)   │  │  (2 pods)   │               │  │
+│  │  └──────┬──────┘  └──────┬──────┘               │  │
+│  │         │                 │                       │  │
+│  │         │                 │                       │  │
+│  │  ┌──────▼─────────────────▼──────┐              │  │
+│  │  │      PostgreSQL Database       │              │  │
+│  │  │       (StatefulSet)            │              │  │
+│  │  └──────▲─────────────────▲──────┘              │  │
+│  │         │                 │                       │  │
+│  │         │                 │                       │  │
+│  │  ┌──────┴──────┐  ┌──────┴──────┐               │  │
+│  │  │FastAPI App1 │  │FastAPI App2 │               │  │
+│  │  │  (2 pods)   │  │  (2 pods)   │               │  │
+│  │  └─────────────┘  └─────────────┘               │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                           │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │         Namespace: monitoring                     │  │
+│  │                                                    │  │
+│  │  ┌────────────┐  ┌─────────┐  ┌──────────────┐  │  │
+│  │  │ Prometheus │  │ Grafana │  │ Alertmanager │  │  │
+│  │  └────────────┘  └─────────┘  └──────────────┘  │  │
+│  └──────────────────────────────────────────────────┘  │
+│                                                           │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │            Infrastructure Layer                   │  │
+│  │                                                    │  │
+│  │  Cilium (CNI + eBPF) │ CoreDNS │ etcd │ Helm     │  │
+│  └──────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────┘
+```
+
+## CNCF Graduated Projects Used
+
+1. **Kubernetes** - Container Orchestration Platform
+2. **containerd** - Container Runtime
+3. **CoreDNS** - DNS and Service Discovery
+4. **etcd** - Distributed Key-Value Store
+5. **Helm** - Package Manager for Kubernetes
+6. **Prometheus** - Monitoring and Alerting
+7. **Cilium** - eBPF-based Networking, Observability, and Security
+
+## Prerequisites
+
+- Ubuntu 20.04+ VM in VirtualBox
+- Minimum 8GB RAM, 4 CPU cores
+- 40GB+ disk space
+- Root/sudo access
+
+## Step-by-Step Installation
+
+### Phase 1: Clean Environment & Install Base Infrastructure
+
+```bash
+# Save and run the base installation script
+chmod +x cloud_native_setup.sh
+./cloud_native_setup.sh
+```
+
+**Verify installation:**
+```bash
+kubectl get nodes
+# Should show: STATUS = Ready
+
+kubectl get pods -A
+# All pods should be Running
+
+cilium status
+# Should show: Cilium OK
+```
+
+### Phase 2: Create Application Files
+
+Create the following directory structure:
+
+```
+~/k8s-apps/
+├── django-app1/
+│   ├── app.py
+│   └── Dockerfile
+├── django-app2/
+│   ├── app.py
+│   └── Dockerfile
+├── fastapi-app1/
+│   ├── main.py
+│   └── Dockerfile
+└── fastapi-app2/
+    ├── main.py
+    └── Dockerfile
+```
+
+**Django App Dockerfile:**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    django==5.0 \
+    gunicorn==21.2.0 \
+    psycopg2-binary==2.9.9 \
+    prometheus-client==0.19.0
+
+COPY app.py .
+
+RUN useradd -m -u 1000 django && \
+    chown -R django:django /app && \
+    mkdir -p /tmp && chown -R django:django /tmp
+
+USER django
+EXPOSE 8000
+
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "2", "app:application"]
+```
+
+**FastAPI App Dockerfile:**
+```dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    fastapi==0.109.0 \
+    uvicorn[standard]==0.27.0 \
+    asyncpg==0.29.0 \
+    prometheus-client==0.19.0
+
+COPY main.py .
+
+RUN useradd -m -u 1000 fastapi && \
+    chown -R fastapi:fastapi /app && \
+    mkdir -p /tmp && chown -R fastapi:fastapi /tmp
+
+USER fastapi
+EXPOSE 8000
+
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+```
+
+Copy the application code from the "Sample Application Code" artifact.
+
+### Phase 3: Build and Push Docker Images
+
+```bash
+cd ~/k8s-apps
+
+# Build Django applications
+for i in 1 2; do
+  cd django-app${i}
+  docker build -t localhost:5000/django-app${i}:latest .
+  docker push localhost:5000/django-app${i}:latest
+  cd ..
+done
+
+# Build FastAPI applications
+for i in 1 2; do
+  cd fastapi-app${i}
+  docker build -t localhost:5000/fastapi-app${i}:latest .
+  docker push localhost:5000/fastapi-app${i}:latest
+  cd ..
+done
+
+# Verify images
+curl http://localhost:5000/v2/_catalog
+```
+
+### Phase 4: Deploy Applications
+
+```bash
+# Apply the application deployment manifest
+kubectl apply -f app-deployment.yaml
+
+# Wait for PostgreSQL to be ready
+kubectl wait --for=condition=ready pod -l app=postgres -n apps --timeout=300s
+
+# Wait for all applications to be ready
+kubectl wait --for=condition=ready pod -l app=django-app1 -n apps --timeout=300s
+kubectl wait --for=condition=ready pod -l app=fastapi-app1 -n apps --timeout=300s
+
+# Check status
+kubectl get pods -n apps
+kubectl get svc -n apps
+```
+
+### Phase 5: Install Monitoring Stack
+
+```bash
+# Run the monitoring setup script
+chmod +x cncf_monitoring.sh
+./cncf_monitoring.sh
+```
+
+Access Grafana:
+```bash
+# Get your node IP
+NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[0].address}')
+echo "Grafana URL: http://${NODE_IP}:30000"
+echo "Username: admin"
+echo "Password: admin123"
+```
+
+### Phase 6: Verify Everything Works
+
+```bash
+# Test Django App 1
+kubectl port-forward -n apps svc/django-app1 8001:8000 &
+curl http://localhost:8001/
+curl http://localhost:8001/health/
+curl http://localhost:8001/api/items
+
+# Test FastAPI App 1
+kubectl port-forward -n apps svc/fastapi-app1 8002:8000 &
+curl http://localhost:8002/
+curl http://localhost:8002/health
+curl http://localhost:8002/api/items
+
+# Create some data
+curl -X POST "http://localhost:8002/api/items?name=Test%20Item"
+
+# Check metrics
+curl http://localhost:8001/metrics
+curl http://localhost:8002/metrics
+
+# Check database connectivity
+kubectl exec -n apps postgres-0 -- psql -U appuser -d appdb -c "\dt"
+```
+
+## Accessing Services
+
+### From Outside the Cluster
+
+**Option 1: Port Forwarding (Development)**
+```bash
+# Django App 1
+kubectl port-forward -n apps svc/django-app1 8001:8000
+
+# FastAPI App 1
+kubectl port-forward -n apps svc/fastapi-app1 8002:8000
+```
+
+**Option 2: NodePort (Production-like)**
+```bash
+# Expose services via NodePort
+kubectl patch svc django-app1 -n apps -p '{"spec":{"type":"NodePort"}}'
+kubectl patch svc fastapi-app1 -n apps -p '{"spec":{"type":"NodePort"}}'
+
+# Get the NodePorts
+kubectl get svc -n apps
+# Access via http://NODE_IP:NodePort
+```
+
+### Monitoring and Observability
+
+1. **Grafana**: `http://NODE_IP:30000` (admin/admin123)
+2. **Prometheus**: `kubectl port-forward -n monitoring svc/prometheus-kube-prometheus-prometheus 9090:9090`
+3. **Hubble UI** (Cilium): `kubectl port-forward -n kube-system svc/hubble-ui 12000:80`
+
+## Key Features Implemented
+
+### Security
+- ✅ Non-root containers
+- ✅ Read-only root filesystems
+- ✅ Dropped all capabilities
+- ✅ Seccomp profiles
+- ✅ Network policies (default deny)
+- ✅ PostgreSQL credentials in Secrets
+
+### High Availability
+- ✅ Multiple replicas (2 per app)
+- ✅ Health checks (liveness + readiness)
+- ✅ Resource limits and requests
+- ✅ StatefulSet for database
+
+### Observability
+- ✅ Prometheus metrics collection
+- ✅ Grafana dashboards
+- ✅ Application-level metrics
+- ✅ Cilium/Hubble network observability
+
+### Cloud Native Best Practices
+- ✅ 12-factor app methodology
+- ✅ Immutable infrastructure
+- ✅ Declarative configuration
+- ✅ Self-healing via Kubernetes
+- ✅ Horizontal scalability
+
+## Troubleshooting
+
+### Pods not starting
+```bash
+kubectl describe pod <pod-name> -n apps
+kubectl logs <pod-name> -n apps
+```
+
+### Database connection issues
+```bash
+# Check PostgreSQL logs
+kubectl logs -n apps postgres-0
+
+# Test connectivity from app pod
+kubectl exec -n apps deployment/django-app1 -- nc -zv postgres 5432
+```
+
+### Image pull errors
+```bash
+# Verify registry
+docker ps | grep registry
+curl http://localhost:5000/v2/_catalog
+
+# Check containerd config
+sudo cat /etc/containerd/certs.d/localhost:5000/hosts.toml
+```
+
+### Network policy issues
+```bash
+# Check Cilium status
+cilium status
+
+# View network policies
+kubectl get networkpolicies -n apps
+
+# Test connectivity
+kubectl run -n apps test-pod --image=busybox --rm -it --restart=Never -- sh
+# Inside pod: wget -O- http://postgres:5432
+```
+
+## Next Steps
+
+### Add More CNCF Projects
+
+**Istio (Service Mesh)**
+```bash
+curl -L https://istio.io/downloadIstio | sh -
+cd istio-*
+export PATH=$PWD/bin:$PATH
+istioctl install --set profile=demo -y
+kubectl label namespace apps istio-injection=enabled
+```
+
+**Falco (Runtime Security)**
+```bash
+helm repo add falcosecurity https://falcosecurity.github.io/charts
+helm install falco falcosecurity/falco \
+  --namespace falco --create-namespace \
+  --set driver.kind=ebpf
+```
+
+**Cert-Manager (Certificate Management)**
+```bash
+kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+```
+
+### Scale Applications
+```bash
+# Scale Django app
+kubectl scale deployment django-app1 -n apps --replicas=5
+
+# Enable autoscaling
+kubectl autoscale deployment django-app1 -n apps --cpu-percent=70 --min=2 --max=10
+```
+
+### Add Ingress
+```bash
+# Install NGINX Ingress Controller
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/baremetal/deploy.yaml
+
+# Create Ingress rules for your apps
+```
+
+## Resource Requirements
+
+| Component | CPU Request | Memory Request | Storage |
+|-----------|------------|----------------|---------|
+| Django Apps (x2) | 400m | 512Mi | - |
+| FastAPI Apps (x2) | 200m | 256Mi | - |
+| PostgreSQL | 250m | 256Mi | 5Gi |
+| Prometheus | 500m | 2Gi | 20Gi |
+| Grafana | 100m | 128Mi | - |
+| Cilium | 200m | 512Mi | - |
+
+**Total**: ~2 CPU cores, ~4.5GB RAM, ~30GB Storage
+
+## References
+
+- [CNCF Graduated Projects](https://www.cncf.io/projects/)
+- [Kubernetes Documentation](https://kubernetes.io/docs/)
+- [Cilium Documentation](https://docs.cilium.io/)
+- [Prometheus Documentation](https://prometheus.io/docs/)
+- [Django Documentation](https://docs.djangoproject.com/)
+- [FastAPI Documentation](https://fastapi.tiangolo.com/)
+
+- I'll help you set up a fresh cloud-native environment with your Django and FastAPI apps connected to PostgreSQL, using CNCF graduated projects for a production-like setup.
+
+Let me first fetch the document to understand what you've tried:I can see you've attempted a comprehensive Kubernetes setup but encountered issues. Let me help you create a **clean, production-ready cloud-native setup** from scratch with the mandatory CNCF graduated projects.Now let me create the additional CNCF components and sample application code:Now let me create one final comprehensive guide:Perfect! I've created a **complete cloud-native setup** for you. Here's what I've provided:
+
+## 📦 What You Get
+
+### 1. **Complete Setup Script** (Artifact 1)
+- Removes old installations cleanly
+- Installs Kubernetes with kubeadm
+- Deploys Cilium CNI with eBPF
+- Sets up local Docker registry
+- Includes all CNCF graduated projects:
+  - ✅ Kubernetes
+  - ✅ containerd
+  - ✅ CoreDNS
+  - ✅ etcd
+  - ✅ Helm
+  - ✅ Cilium (networking + eBPF)
+
+### 2. **Application Deployment** (Artifact 2)
+- 2 Django applications
+- 2 FastAPI applications
+- Shared PostgreSQL database
+- Production-ready security:
+  - Non-root containers
+  - Read-only filesystems
+  - Network policies
+  - Resource limits
+- Health checks and monitoring
+
+### 3. **Monitoring Stack** (Artifact 3)
+- Prometheus for metrics
+- Grafana dashboards
+- Alertmanager
+- ServiceMonitors for your apps
+
+### 4. **Sample Code** (Artifact 4)
+- Complete Django app with PostgreSQL
+- Complete FastAPI app with async PostgreSQL
+- Dockerfiles for both
+- Prometheus metrics integration
+- Health and readiness endpoints
+
+### 5. **Complete Guide** (Artifact 5)
+- Step-by-step instructions
+- Architecture diagram
+- Troubleshooting section
+- Next steps for expansion
+
+## 🚀 Quick Start
+
+```bash
+# 1. Save and run the setup script
+bash cloud_native_setup.sh
+
+# 2. Create your app files and build images
+# (Follow the guide in Artifact 5)
+
+# 3. Deploy applications
+kubectl apply -f app-deployment.yaml
+
+# 4. Install monitoring
+bash cncf_monitoring.sh
+
+# 5. Access your apps
+kubectl port-forward -n apps svc/django-app1 8001:8000
+kubectl port-forward -n apps svc/fastapi-app1 8002:8000
+```
+
+## 🎯 Key Features
+
+- **Production-Ready**: Security hardening, resource limits, health checks
+- **Observable**: Prometheus metrics, Grafana dashboards, Cilium Hubble
+- **Scalable**: Multiple replicas, horizontal pod autoscaling ready
+- **Secure**: Network policies, non-root containers, secrets management
+- **Cloud-Native**: Using only CNCF graduated projects
+
+All the code is ready to use! Just follow the guide and you'll have a fully functional cloud-native environment. Let me know if you need help with any specific part!
