@@ -2371,3 +2371,2468 @@ kubectl get pods -A
 ```
 
 **That's it!** Share the output of the last command and we'll proceed to install Istio, Prometheus, and Falco.
+
+**Summary:** Clean up your K8s cluster by removing unintended resources, then deploy FastAPI and Django services with production-grade manifests, observability, and security.
+
+---
+
+## 1. Audit & Remove Unwanted Resources
+
+First, let's see what's currently running:
+
+```bash
+# Cluster-wide resource inventory
+kubectl get all -A -o wide > /tmp/k8s-inventory.txt
+kubectl get pv,pvc -A >> /tmp/k8s-inventory.txt
+kubectl get ingress -A >> /tmp/k8s-inventory.txt
+kubectl get configmap,secret -A | grep -v "kube-system\|kube-public\|kube-node-lease\|default/default" >> /tmp/k8s-inventory.txt
+
+# Check what's consuming resources
+kubectl top nodes
+kubectl top pods -A
+
+# List Helm releases
+helm list -A
+
+# Show running containers on host
+docker ps -a
+```
+
+**Tell me:**
+1. What namespaces/deployments/services do you see that were mistakes?
+2. Any Helm charts you want removed?
+3. Output of `kubectl get ns` and `helm list -A`
+
+**Common cleanup pattern** (adapt to your output):
+
+```bash
+# Remove unwanted namespaces (cascades delete)
+kubectl delete ns <unwanted-namespace> --grace-period=0 --force
+
+# Remove specific resources
+kubectl delete deployment <name> -n <namespace>
+kubectl delete svc <name> -n <namespace>
+
+# Uninstall Helm releases
+helm uninstall <release-name> -n <namespace>
+
+# Clean up orphaned PVs
+kubectl get pv | grep Released | awk '{print $1}' | xargs -r kubectl delete pv
+
+# Remove unused Docker images on nodes
+docker system prune -a --volumes -f
+```
+
+---
+
+## 2. FastAPI Service Deployment
+
+### Directory Structure
+```
+fastapi-service/
+├── app/
+│   ├── main.py
+│   ├── models.py
+│   ├── config.py
+│   └── health.py
+├── Dockerfile
+├── requirements.txt
+└── k8s/
+    ├── namespace.yaml
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── hpa.yaml
+    └── networkpolicy.yaml
+```
+
+### FastAPI App (app/main.py)
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+from prometheus_client import Counter, Histogram, generate_latest
+import time
+
+app = FastAPI(title="FastAPI Service", version="1.0.0")
+
+REQUEST_COUNT = Counter('http_requests_total', 'Total HTTP requests', ['method', 'endpoint', 'status'])
+REQUEST_LATENCY = Histogram('http_request_duration_seconds', 'HTTP request latency')
+
+@app.middleware("http")
+async def add_metrics(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    REQUEST_LATENCY.observe(time.time() - start)
+    REQUEST_COUNT.labels(request.method, request.url.path, response.status_code).inc()
+    return response
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+@app.get("/ready")
+async def ready():
+    # Add dependency checks (DB, cache)
+    return {"status": "ready"}
+
+@app.get("/metrics")
+async def metrics():
+    return generate_latest()
+
+@app.get("/api/v1/items")
+async def list_items():
+    return {"items": ["item1", "item2"]}
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim as builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 appuser
+WORKDIR /app
+COPY --from=builder /root/.local /home/appuser/.local
+COPY app/ ./app/
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+```
+
+### K8s Manifests (k8s/deployment.yaml)
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi
+  namespace: fastapi
+  labels:
+    app: fastapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fastapi
+  template:
+    metadata:
+      labels:
+        app: fastapi
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: fastapi
+        image: localhost:5000/fastapi:latest
+        ports:
+        - containerPort: 8000
+          name: http
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+```
+
+---
+
+## 3. Django Service Deployment
+
+### Django Setup
+```bash
+# Create Django project structure
+mkdir -p django-service/app
+cd django-service
+python3 -m venv venv
+source venv/bin/activate
+pip install django djangorestframework gunicorn psycopg2-binary prometheus-client
+django-admin startproject config app/
+cd app
+python manage.py startapp api
+```
+
+### settings.py additions
+```python
+ALLOWED_HOSTS = ['*']  # Restrict in production
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'django_db'),
+        'USER': os.getenv('DB_USER', 'django'),
+        'PASSWORD': os.getenv('DB_PASSWORD', 'changeme'),
+        'HOST': os.getenv('DB_HOST', 'postgres-svc'),
+        'PORT': '5432',
+    }
+}
+INSTALLED_APPS += ['rest_framework', 'api']
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim
+RUN useradd -m -u 1000 django
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY app/ .
+RUN python manage.py collectstatic --noinput
+USER django
+EXPOSE 8000
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "4"]
+```
+
+### K8s Deployment (k8s/deployment.yaml)
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: django
+  namespace: django
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: django
+  template:
+    metadata:
+      labels:
+        app: django
+    spec:
+      initContainers:
+      - name: migrate
+        image: localhost:5000/django:latest
+        command: ["python", "manage.py", "migrate"]
+        envFrom:
+        - secretRef:
+            name: django-secrets
+      containers:
+      - name: django
+        image: localhost:5000/django:latest
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        envFrom:
+        - secretRef:
+            name: django-secrets
+        livenessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+          initialDelaySeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /ready/
+            port: 8000
+          initialDelaySeconds: 10
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+        - name: static
+          mountPath: /app/staticfiles
+      volumes:
+      - name: tmp
+        emptyDir: {}
+      - name: static
+        emptyDir: {}
+```
+
+---
+
+## 4. Build & Deploy
+
+```bash
+# FastAPI
+cd fastapi-service
+docker build -t localhost:5000/fastapi:latest .
+docker push localhost:5000/fastapi:latest
+
+kubectl create ns fastapi
+kubectl apply -f k8s/
+
+# Django
+cd ../django-service
+docker build -t localhost:5000/django:latest .
+docker push localhost:5000/django:latest
+
+kubectl create ns django
+kubectl create secret generic django-secrets -n django \
+  --from-literal=DB_NAME=django_db \
+  --from-literal=DB_USER=django \
+  --from-literal=DB_PASSWORD=changeme \
+  --from-literal=DB_HOST=postgres-svc
+
+kubectl apply -f k8s/
+
+# Verify
+kubectl get pods -n fastapi -w
+kubectl get pods -n django -w
+```
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│              Ingress (Nginx)                    │
+│  /fastapi/* → fastapi-svc:8000                  │
+│  /django/*  → django-svc:8000                   │
+└────────────┬────────────────────────────────────┘
+             │
+    ┌────────┴──────────┐
+    │                   │
+┌───▼─────┐      ┌──────▼───┐
+│ FastAPI │      │  Django  │
+│ Pods x2 │      │ Pods x2  │
+└─────────┘      └────┬─────┘
+                      │
+                 ┌────▼─────┐
+                 │ Postgres │
+                 │  StatefulSet
+                 └──────────┘
+```
+
+---
+
+## Threat Model & Mitigations
+
+| Threat | Mitigation |
+|--------|-----------|
+| Container escape | seccompProfile, AppArmor, readOnlyRootFilesystem |
+| Supply chain attack | Multi-stage builds, minimal base images, image scanning |
+| Secrets in env | Use Secrets, consider Vault/External Secrets Operator |
+| SQL injection (Django) | ORM parameterized queries, rate limiting |
+| DoS | HPA, NetworkPolicies, resource limits |
+| Lateral movement | NetworkPolicies (deny-all default) |
+
+---
+
+## Tests
+
+```bash
+# FastAPI unit tests
+cd fastapi-service
+pytest app/tests/ --cov=app --cov-report=term-missing
+
+# Load test
+kubectl run -it --rm load-test --image=williamyeh/hey:latest --restart=Never -- \
+  -z 30s -c 10 http://fastapi-svc.fastapi.svc.cluster.local:8000/api/v1/items
+
+# Django tests
+cd django-service
+python manage.py test
+
+# Integration test
+kubectl run -it --rm curl --image=curlimages/curl:latest --restart=Never -- \
+  curl -v http://django-svc.django.svc.cluster.local:8000/health/
+```
+
+---
+
+## Rollout/Rollback
+
+```bash
+# Rollout
+kubectl set image deployment/fastapi fastapi=localhost:5000/fastapi:v2 -n fastapi
+kubectl rollout status deployment/fastapi -n fastapi
+
+# Rollback
+kubectl rollout undo deployment/fastapi -n fastapi
+kubectl rollout history deployment/fastapi -n fastapi
+```
+
+---
+
+## Next 3 Steps
+
+1. **Provide cleanup targets:** Share `kubectl get all -A` output so I generate exact delete commands
+2. **Database setup:** Do you want Postgres in-cluster (StatefulSet) or external? If in-cluster, I'll provide manifests with PVCs + backups
+3. **Ingress config:** Share your Ingress YAML or confirm you want me to create routes for `/fastapi/*` and `/django/*`
+
+**What to send me:**
+```bash
+kubectl get ns
+kubectl get all -A | head -50
+helm list -A
+```
+
+**Summary:** Your cluster is clean—only essential K8s + Cilium CNI running. Fix local-registry crash loop, deploy metrics-server, then FastAPI + Django with Postgres backend.
+
+---
+
+## 1. Immediate Fixes
+
+### Fix Local Registry (crashing every 40s)
+```bash
+# Check why it's failing
+docker logs local-registry --tail 50
+
+# Likely fix: recreate with proper config
+docker rm -f local-registry
+docker run -d \
+  --name local-registry \
+  --restart=always \
+  -p 5000:5000 \
+  -v /var/lib/registry:/var/lib/registry \
+  registry:2
+
+# Verify
+docker ps | grep registry
+curl http://localhost:5000/v2/_catalog
+```
+
+### Install Metrics Server (for `kubectl top`)
+```bash
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# Patch for single-node/self-signed certs
+kubectl patch deployment metrics-server -n kube-system --type='json' \
+  -p='[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]'
+
+# Verify (wait 60s)
+kubectl top nodes
+```
+
+### Clean Up Docker Test Containers
+```bash
+docker rm awesome_shannon funny_hypatia zealous_cohen
+docker system prune -f
+```
+
+---
+
+## 2. Deploy Postgres (Backend for Django)
+
+### postgres-namespace.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres
+```
+
+### postgres-secret.yaml
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+  namespace: postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: django
+  POSTGRES_PASSWORD: "SecurePass123!"  # Change this
+  POSTGRES_DB: django_db
+```
+
+### postgres-statefulset.yaml
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: postgres
+spec:
+  serviceName: postgres-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        envFrom:
+        - secretRef:
+            name: postgres-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+```
+
+**Deploy:**
+```bash
+kubectl apply -f postgres-namespace.yaml
+kubectl apply -f postgres-secret.yaml
+kubectl apply -f postgres-statefulset.yaml
+
+# Wait for ready
+kubectl wait --for=condition=ready pod -l app=postgres -n postgres --timeout=120s
+```
+
+---
+
+## 3. FastAPI Service
+
+### Directory Structure
+```bash
+mkdir -p ~/Documents/cloud_native/k8s-apps/fastapi-service/{app,k8s}
+cd ~/Documents/cloud_native/k8s-apps/fastapi-service
+```
+
+### app/main.py
+```python
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+import os
+
+app = FastAPI(
+    title="FastAPI Service",
+    version="1.0.0",
+    root_path="/fastapi"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+REQUEST_COUNT = Counter('http_requests_total', 'Total requests', ['method', 'endpoint'])
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "fastapi"}
+
+@app.get("/ready")
+def ready():
+    return {"status": "ready"}
+
+@app.get("/metrics")
+def metrics():
+    REQUEST_COUNT.labels(method="GET", endpoint="/metrics").inc()
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/api/v1/items")
+def list_items():
+    REQUEST_COUNT.labels(method="GET", endpoint="/api/v1/items").inc()
+    return {
+        "items": [
+            {"id": 1, "name": "Item One"},
+            {"id": 2, "name": "Item Two"}
+        ]
+    }
+
+@app.post("/api/v1/items")
+def create_item(name: str):
+    REQUEST_COUNT.labels(method="POST", endpoint="/api/v1/items").inc()
+    return {"id": 3, "name": name, "created": True}
+```
+
+### requirements.txt
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+prometheus-client==0.19.0
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 appuser && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /root/.local /home/appuser/.local
+COPY app/ ./app/
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### k8s/namespace.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fastapi
+  labels:
+    name: fastapi
+```
+
+### k8s/deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi
+  namespace: fastapi
+  labels:
+    app: fastapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fastapi
+  template:
+    metadata:
+      labels:
+        app: fastapi
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/fastapi/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: fastapi
+        image: localhost:5000/fastapi:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        env:
+        - name: PORT
+          value: "8000"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /fastapi/health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /fastapi/ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-svc
+  namespace: fastapi
+spec:
+  selector:
+    app: fastapi
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+```
+
+### k8s/networkpolicy.yaml
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fastapi-netpol
+  namespace: fastapi
+spec:
+  podSelector:
+    matchLabels:
+      app: fastapi
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  - to:
+    - podSelector: {}
+```
+
+**Build & Deploy:**
+```bash
+cd ~/Documents/cloud_native/k8s-apps/fastapi-service
+
+docker build -t localhost:5000/fastapi:latest .
+docker push localhost:5000/fastapi:latest
+
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/networkpolicy.yaml
+
+# Verify
+kubectl get pods -n fastapi -w
+kubectl logs -n fastapi -l app=fastapi --tail=20
+```
+
+---
+
+## 4. Django Service
+
+### Directory Structure
+```bash
+mkdir -p ~/Documents/cloud_native/k8s-apps/django-service/{app,k8s}
+cd ~/Documents/cloud_native/k8s-apps/django-service
+```
+
+### Setup Django Project
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install django==5.0 djangorestframework gunicorn psycopg2-binary
+django-admin startproject config app/
+cd app
+python manage.py startapp api
+cd ..
+```
+
+### app/config/settings.py (append/modify)
+```python
+import os
+
+ALLOWED_HOSTS = ['*']
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'django_db'),
+        'USER': os.getenv('DB_USER', 'django'),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST': os.getenv('DB_HOST', 'postgres-svc.postgres.svc.cluster.local'),
+        'PORT': '5432',
+    }
+}
+
+INSTALLED_APPS += ['rest_framework', 'api']
+
+ROOT_URLCONF = 'config.urls_custom'
+
+STATIC_ROOT = '/tmp/staticfiles'
+STATIC_URL = '/django/static/'
+```
+
+### app/config/urls_custom.py
+```python
+from django.contrib import admin
+from django.urls import path, include
+from django.http import JsonResponse
+
+def health(request):
+    return JsonResponse({"status": "healthy", "service": "django"})
+
+def ready(request):
+    from django.db import connection
+    try:
+        connection.ensure_connection()
+        return JsonResponse({"status": "ready", "db": "connected"})
+    except Exception as e:
+        return JsonResponse({"status": "not ready", "error": str(e)}, status=503)
+
+urlpatterns = [
+    path('django/admin/', admin.site.urls),
+    path('django/health/', health),
+    path('django/ready/', ready),
+    path('django/api/', include('api.urls')),
+]
+```
+
+### app/api/urls.py
+```python
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('items/', views.items_list),
+]
+```
+
+### app/api/views.py
+```python
+from django.http import JsonResponse
+
+def items_list(request):
+    items = [
+        {"id": 1, "name": "Django Item One"},
+        {"id": 2, "name": "Django Item Two"}
+    ]
+    return JsonResponse({"items": items})
+```
+
+### requirements.txt
+```
+Django==5.0
+djangorestframework==3.14.0
+gunicorn==21.2.0
+psycopg2-binary==2.9.9
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 django && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /root/.local /home/django/.local
+COPY app/ .
+RUN mkdir -p /tmp/staticfiles && chown -R django:django /tmp/staticfiles
+USER django
+ENV PATH=/home/django/.local/bin:$PATH
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8000/django/health/ || exit 1
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2"]
+```
+
+### k8s/namespace.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: django
+  labels:
+    name: django
+```
+
+### k8s/secret.yaml
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: django-secrets
+  namespace: django
+type: Opaque
+stringData:
+  DB_NAME: django_db
+  DB_USER: django
+  DB_PASSWORD: "SecurePass123!"  # Must match postgres-secret
+  DB_HOST: postgres-svc.postgres.svc.cluster.local
+  SECRET_KEY: "django-insecure-CHANGE-THIS-IN-PRODUCTION"
+```
+
+### k8s/deployment.yaml
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: django
+  namespace: django
+  labels:
+    app: django
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: django
+  template:
+    metadata:
+      labels:
+        app: django
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: migrate
+        image: localhost:5000/django:latest
+        command: ["python", "manage.py", "migrate", "--noinput"]
+        envFrom:
+        - secretRef:
+            name: django-secrets
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+      containers:
+      - name: django
+        image: localhost:5000/django:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        envFrom:
+        - secretRef:
+            name: django-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /django/health/
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /django/ready/
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-svc
+  namespace: django
+spec:
+  selector:
+    app: django
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+```
+
+### k8s/networkpolicy.yaml
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: django-netpol
+  namespace: django
+spec:
+  podSelector:
+    matchLabels:
+      app: django
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+```
+
+**Build & Deploy:**
+```bash
+cd ~/Documents/cloud_native/k8s-apps/django-service
+
+docker build -t localhost:5000/django:latest .
+docker push localhost:5000/django:latest
+
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/networkpolicy.yaml
+
+# Verify
+kubectl get pods -n django -w
+kubectl logs -n django -l app=django --tail=30
+```
+
+---
+
+## 5. Testing
+
+```bash
+# Port-forward FastAPI
+kubectl port-forward -n fastapi svc/fastapi-svc 8001:8000 &
+curl http://localhost:8001/fastapi/health
+curl http://localhost:8001/fastapi/api/v1/items
+
+# Port-forward Django
+kubectl port-forward -n django svc/django-svc 8002:8000 &
+curl http://localhost:8002/django/health/
+curl http://localhost:8002/django/api/items/
+
+# Check DB connectivity from Django pod
+kubectl exec -n django -it deploy/django -- python manage.py dbshell
+# Run: \dt (should show migrations table)
+
+# Network policy test
+kubectl run -n default test-curl --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://fastapi-svc.fastapi.svc.cluster.local:8000/fastapi/health
+```
+
+---
+
+## Architecture
+
+```
+┌──────────────────────────────────────────────┐
+│         Cluster: cloudnative (10.0.2.15)     │
+├──────────────────────────────────────────────┤
+│  Namespaces:                                 │
+│  ┌─────────────┐  ┌─────────────┐           │
+│  │  fastapi    │  │   django    │           │
+│  │  Pods x2    │  │   Pods x2   │           │
+│  │  Port 8000  │  │   Port 8000 │           │
+│  └──────┬──────┘  └──────┬──────┘           │
+│         │                │                   │
+│         │                └────────┐          │
+│         │                         │          │
+│  ┌──────▼─────────────────────────▼──────┐  │
+│  │         postgres namespace            │  │
+│  │  StatefulSet: postgres                │  │
+│  │  PVC: 5Gi, Port 5432                  │  │
+│  └───────────────────────────────────────┘  │
+│                                              │
+│  CNI: Cilium (eBPF), Hubble UI enabled      │
+└──────────────────────────────────────────────┘
+```
+
+---
+
+## Threat Model
+
+| Threat | Mitigation | Validation |
+|--------|-----------|------------|
+| Pod escape | seccomp, readOnlyRootFS, drop ALL caps | `kubectl auth can-i --list --as=system:serviceaccount:django:default` |
+| DB credential leak | K8s Secrets (base64), NetworkPolicies | `kubectl get secret django-secrets -n django -o yaml` (verify not in logs) |
+| Lateral movement | NetworkPolicies (default deny) | `kubectl exec -n fastapi deploy/fastapi -- curl django-svc.django:8000` (should fail) |
+| Supply chain | Multi-stage builds, Alpine base, no root | `docker history localhost:5000/django:latest \| grep USER` |
+| DoS | Resource limits, readiness probes | `kubectl top pods -n django` |
+
+---
+
+## Next 3 Steps
+
+1. **Install Ingress Controller** (expose services externally):
+```bash
+kubectl apply -f https://raw.githubusercontent.com/kubernetes/ingress-nginx/main/deploy/static/provider/baremaid/deploy.yaml
+```
+Then provide Ingress manifest for `/fastapi/*` and `/django/*` routes.
+
+2. **Add Observability** (Prometheus + Grafana):
+   - Do you want me to provide kube-prometheus-stack manifests or Helm values?
+
+3. **CI/CD Pipeline**: 
+   - Confirm your Git repo structure so I can provide GitHub Actions / GitLab CI for automated builds + rollouts.
+
+**Send me:** Results of the test curl commands so I verify networking is correct.
+
+**Summary:** Registry fixed. Metrics-server needs 60s to scrape kubelet metrics. Deploy Postgres, FastAPI, Django now while waiting.
+
+---
+
+## 1. Verify Metrics Server (wait ~60s)
+
+```bash
+# Check if metrics-server pod is running
+kubectl get pods -n kube-system -l k8s-app=metrics-server
+
+# Check logs for issues
+kubectl logs -n kube-system -l k8s-app=metrics-server --tail=50
+
+# Wait 60 seconds, then retry
+sleep 60
+kubectl top nodes
+```
+
+**If still failing after 60s:**
+```bash
+# Debug metrics-server
+kubectl describe apiservice v1beta1.metrics.k8s.io
+kubectl get pods -n kube-system -l k8s-app=metrics-server -o yaml | grep -A5 "args:"
+```
+
+---
+
+## 2. Deploy Postgres (Backend for Django)
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p postgres/k8s
+cd postgres
+```
+
+### k8s/postgres-all.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres
+  labels:
+    name: postgres
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+  namespace: postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: django
+  POSTGRES_PASSWORD: "SecurePass123!"
+  POSTGRES_DB: django_db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: postgres
+spec:
+  serviceName: postgres-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        envFrom:
+        - secretRef:
+            name: postgres-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+```
+
+**Deploy:**
+```bash
+kubectl apply -f k8s/postgres-all.yaml
+
+# Wait for StatefulSet ready
+kubectl wait --for=condition=ready pod -l app=postgres -n postgres --timeout=120s
+
+# Verify
+kubectl get pods -n postgres
+kubectl logs -n postgres postgres-0 --tail=20
+```
+
+---
+
+## 3. Deploy FastAPI
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p fastapi-service/{app,k8s}
+cd fastapi-service
+```
+
+### app/main.py
+```python
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+import time
+
+app = FastAPI(
+    title="FastAPI Service",
+    version="1.0.0",
+    root_path="/fastapi"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+REQUEST_COUNT = Counter('http_requests_total', 'Total requests', ['method', 'endpoint', 'status'])
+
+@app.middleware("http")
+async def add_metrics(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    REQUEST_COUNT.labels(request.method, request.url.path, response.status_code).inc()
+    return response
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "fastapi"}
+
+@app.get("/ready")
+def ready():
+    return {"status": "ready"}
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/api/v1/items")
+def list_items():
+    return {
+        "items": [
+            {"id": 1, "name": "FastAPI Item One"},
+            {"id": 2, "name": "FastAPI Item Two"}
+        ]
+    }
+
+@app.post("/api/v1/items")
+def create_item(name: str):
+    return {"id": 3, "name": name, "created": True}
+```
+
+### requirements.txt
+```
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+prometheus-client==0.19.0
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 appuser && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /root/.local /home/appuser/.local
+COPY app/ ./app/
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+### k8s/fastapi-all.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fastapi
+  labels:
+    name: fastapi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fastapi
+  namespace: fastapi
+  labels:
+    app: fastapi
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: fastapi
+  template:
+    metadata:
+      labels:
+        app: fastapi
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/fastapi/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: fastapi
+        image: localhost:5000/fastapi:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+          protocol: TCP
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 3
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fastapi-svc
+  namespace: fastapi
+spec:
+  selector:
+    app: fastapi
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fastapi-netpol
+  namespace: fastapi
+spec:
+  podSelector:
+    matchLabels:
+      app: fastapi
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+  - to:
+    - podSelector: {}
+```
+
+**Build & Deploy:**
+```bash
+docker build -t localhost:5000/fastapi:latest .
+docker push localhost:5000/fastapi:latest
+
+kubectl apply -f k8s/fastapi-all.yaml
+
+# Verify
+kubectl get pods -n fastapi -w
+# Press Ctrl+C when both pods are Running
+
+kubectl logs -n fastapi -l app=fastapi --tail=20 --all-containers
+```
+
+---
+
+## 4. Deploy Django
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p django-service/{app,k8s}
+cd django-service
+```
+
+### Setup Django (if you don't have it locally)
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install django==5.0 djangorestframework gunicorn psycopg2-binary
+```
+
+### Create Django Project Structure
+```bash
+django-admin startproject config app/
+cd app
+python manage.py startapp api
+cd ../..
+```
+
+### app/config/settings.py
+**Add/modify these lines** (keep existing Django defaults):
+```python
+import os
+
+# ... existing SECRET_KEY, DEBUG, etc. ...
+
+ALLOWED_HOSTS = ['*']
+
+# Database - replace the existing DATABASES config
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.getenv('DB_NAME', 'django_db'),
+        'USER': os.getenv('DB_USER', 'django'),
+        'PASSWORD': os.getenv('DB_PASSWORD', ''),
+        'HOST': os.getenv('DB_HOST', 'postgres-svc.postgres.svc.cluster.local'),
+        'PORT': '5432',
+    }
+}
+
+# Add to INSTALLED_APPS
+INSTALLED_APPS += [
+    'rest_framework',
+    'api',
+]
+
+# Static files
+STATIC_ROOT = '/tmp/staticfiles'
+STATIC_URL = '/django/static/'
+
+# Custom URLs
+ROOT_URLCONF = 'config.urls_custom'
+```
+
+### app/config/urls_custom.py
+```python
+from django.contrib import admin
+from django.urls import path, include
+from django.http import JsonResponse
+
+def health(request):
+    return JsonResponse({"status": "healthy", "service": "django"})
+
+def ready(request):
+    from django.db import connection
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        return JsonResponse({"status": "ready", "db": "connected"})
+    except Exception as e:
+        return JsonResponse({"status": "not ready", "error": str(e)}, status=503)
+
+urlpatterns = [
+    path('admin/', admin.site.urls),
+    path('health/', health),
+    path('ready/', ready),
+    path('api/', include('api.urls')),
+]
+```
+
+### app/api/urls.py
+```python
+from django.urls import path
+from . import views
+
+urlpatterns = [
+    path('items/', views.items_list, name='items_list'),
+]
+```
+
+### app/api/views.py
+```python
+from django.http import JsonResponse
+
+def items_list(request):
+    items = [
+        {"id": 1, "name": "Django Item One"},
+        {"id": 2, "name": "Django Item Two"}
+    ]
+    return JsonResponse({"items": items})
+```
+
+### requirements.txt
+```
+Django==5.0
+djangorestframework==3.14.0
+gunicorn==21.2.0
+psycopg2-binary==2.9.9
+```
+
+### Dockerfile
+```dockerfile
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 django && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /root/.local /home/django/.local
+COPY app/ .
+RUN mkdir -p /tmp/staticfiles && chown -R django:django /tmp
+USER django
+ENV PATH=/home/django/.local/bin:$PATH
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8000/health/ || exit 1
+CMD ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "60"]
+```
+
+### k8s/django-all.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: django
+  labels:
+    name: django
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: django-secrets
+  namespace: django
+type: Opaque
+stringData:
+  DB_NAME: django_db
+  DB_USER: django
+  DB_PASSWORD: "SecurePass123!"
+  DB_HOST: postgres-svc.postgres.svc.cluster.local
+  SECRET_KEY: "django-insecure-CHANGE-THIS-IN-PRODUCTION-k8s-cluster"
+  DJANGO_SETTINGS_MODULE: "config.settings"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: django
+  namespace: django
+  labels:
+    app: django
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: django
+  template:
+    metadata:
+      labels:
+        app: django
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+      - name: migrate
+        image: localhost:5000/django:latest
+        command: ["python", "manage.py", "migrate", "--noinput"]
+        envFrom:
+        - secretRef:
+            name: django-secrets
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      containers:
+      - name: django
+        image: localhost:5000/django:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8000
+          name: http
+        envFrom:
+        - secretRef:
+            name: django-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /ready/
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      volumes:
+      - name: tmp
+        emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: django-svc
+  namespace: django
+spec:
+  selector:
+    app: django
+  ports:
+  - protocol: TCP
+    port: 8000
+    targetPort: 8000
+  type: ClusterIP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: django-netpol
+  namespace: django
+spec:
+  podSelector:
+    matchLabels:
+      app: django
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 8000
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+```
+
+**Build & Deploy:**
+```bash
+docker build -t localhost:5000/django:latest .
+docker push localhost:5000/django:latest
+
+kubectl apply -f k8s/django-all.yaml
+
+# Verify
+kubectl get pods -n django -w
+# Press Ctrl+C when both pods are Running
+
+kubectl logs -n django -l app=django --tail=30 --all-containers
+```
+
+---
+
+## 5. Test Everything
+
+```bash
+# Test FastAPI
+kubectl run test-fastapi --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://fastapi-svc.fastapi.svc.cluster.local:8000/health
+
+kubectl run test-fastapi-items --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://fastapi-svc.fastapi.svc.cluster.local:8000/api/v1/items
+
+# Test Django
+kubectl run test-django --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://django-svc.django.svc.cluster.local:8000/health/
+
+kubectl run test-django-db --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://django-svc.django.svc.cluster.local:8000/ready/
+
+kubectl run test-django-items --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -v http://django-svc.django.svc.cluster.local:8000/api/items/
+
+# Test DB from Django pod
+kubectl exec -n django deploy/django -- python manage.py dbshell -c "\dt"
+
+# Port-forward for local access
+kubectl port-forward -n fastapi svc/fastapi-svc 8001:8000 &
+kubectl port-forward -n django svc/django-svc 8002:8000 &
+
+# From another terminal or browser
+curl http://localhost:8001/health
+curl http://localhost:8001/api/v1/items
+curl http://localhost:8002/health/
+curl http://localhost:8002/api/items/
+```
+
+---
+
+## Architecture Now Deployed
+
+```
+cloudnative (10.0.2.15)
+├── kube-system (Cilium CNI, CoreDNS, Hubble)
+├── postgres (StatefulSet: postgres-0, PVC: 5Gi)
+├── fastapi (Deployment: 2 replicas, port 8000)
+└── django (Deployment: 2 replicas, port 8000)
+    └──> postgres-svc.postgres:5432
+```
+
+---
+
+## Next 3 Steps
+
+1. **Send test outputs:** Share results of the `curl` commands so I verify networking works
+2. **Ingress setup:** Install nginx-ingress and expose services on `/fastapi/*` and `/django/*`
+3. **Observability:** Deploy Prometheus + Grafana for metrics/alerts
+
+**What to send me:**
+```bash
+kubectl get pods -A
+kubectl logs -n django -l app=django --tail=20 | grep -i error
+kubectl logs -n fastapi -l app=fastapi --tail=20 | grep -i error
+```
+
+**Summary:** Metrics-server pods are Pending (no endpoints). This is a scheduling issue—likely tolerations missing for single-node control-plane. Fix metrics-server, then proceed with app deployments.
+
+---
+
+## 1. Fix Metrics Server (Control-Plane Toleration)
+
+Your node is a control-plane, so metrics-server needs tolerations to schedule on it.
+
+```bash
+# Check node taints
+kubectl describe node cloudnative | grep -A5 Taints
+
+# Delete existing broken metrics-server deployment
+kubectl delete deployment metrics-server -n kube-system
+kubectl delete apiservice v1beta1.metrics.k8s.io
+
+# Create fixed metrics-server manifest
+cat > /tmp/metrics-server-fixed.yaml <<'EOF'
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    k8s-app: metrics-server
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+  name: system:aggregated-metrics-reader
+rules:
+- apiGroups:
+  - metrics.k8s.io
+  resources:
+  - pods
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: system:metrics-server
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes/metrics
+  verbs:
+  - get
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  - nodes
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: metrics-server-auth-reader
+  namespace: kube-system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: extension-apiserver-authentication-reader
+subjects:
+- kind: ServiceAccount
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: metrics-server:system:auth-delegator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:auth-delegator
+subjects:
+- kind: ServiceAccount
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: system:metrics-server
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: system:metrics-server
+subjects:
+- kind: ServiceAccount
+  name: metrics-server
+  namespace: kube-system
+---
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: metrics-server
+  namespace: kube-system
+spec:
+  ports:
+  - name: https
+    port: 443
+    protocol: TCP
+    targetPort: https
+  selector:
+    k8s-app: metrics-server
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: metrics-server
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      k8s-app: metrics-server
+  strategy:
+    rollingUpdate:
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        k8s-app: metrics-server
+    spec:
+      containers:
+      - args:
+        - --cert-dir=/tmp
+        - --secure-port=10250
+        - --kubelet-preferred-address-types=InternalIP,ExternalIP,Hostname
+        - --kubelet-use-node-status-port
+        - --metric-resolution=15s
+        - --kubelet-insecure-tls
+        image: registry.k8s.io/metrics-server/metrics-server:v0.7.0
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /livez
+            port: https
+            scheme: HTTPS
+          periodSeconds: 10
+        name: metrics-server
+        ports:
+        - containerPort: 10250
+          name: https
+          protocol: TCP
+        readinessProbe:
+          failureThreshold: 3
+          httpGet:
+            path: /readyz
+            port: https
+            scheme: HTTPS
+          initialDelaySeconds: 20
+          periodSeconds: 10
+        resources:
+          requests:
+            cpu: 100m
+            memory: 200Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
+        volumeMounts:
+        - mountPath: /tmp
+          name: tmp-dir
+      nodeSelector:
+        kubernetes.io/os: linux
+      priorityClassName: system-cluster-critical
+      serviceAccountName: metrics-server
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      volumes:
+      - emptyDir: {}
+        name: tmp-dir
+---
+apiVersion: apiregistration.k8s.io/v1
+kind: APIService
+metadata:
+  labels:
+    k8s-app: metrics-server
+  name: v1beta1.metrics.k8s.io
+spec:
+  group: metrics.k8s.io
+  groupPriorityMinimum: 100
+  insecureSkipTLSVerify: true
+  service:
+    name: metrics-server
+    namespace: kube-system
+  version: v1beta1
+  versionPriority: 100
+EOF
+
+# Apply fixed version
+kubectl apply -f /tmp/metrics-server-fixed.yaml
+
+# Wait for pod to start
+kubectl wait --for=condition=ready pod -l k8s-app=metrics-server -n kube-system --timeout=120s
+
+# Verify
+kubectl get pods -n kube-system -l k8s-app=metrics-server
+kubectl top nodes
+```
+
+---
+
+## 2. Deploy Postgres (Proceed While Metrics Stabilizes)
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p postgres/k8s
+cd postgres
+```
+
+### k8s/postgres-all.yaml
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: postgres
+  labels:
+    name: postgres
+    kubernetes.io/metadata.name: postgres
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secrets
+  namespace: postgres
+type: Opaque
+stringData:
+  POSTGRES_USER: django
+  POSTGRES_PASSWORD: "SecurePass123!"
+  POSTGRES_DB: django_db
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-svc
+  namespace: postgres
+spec:
+  selector:
+    app: postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+  clusterIP: None
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: postgres
+spec:
+  serviceName: postgres-svc
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: postgres
+        image: postgres:16-alpine
+        ports:
+        - containerPort: 5432
+          name: postgres
+        envFrom:
+        - secretRef:
+            name: postgres-secrets
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "django"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop: ["ALL"]
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+```
+
+**Deploy:**
+```bash
+kubectl apply -f k8s/postgres-all.yaml
+
+# Monitor deployment
+kubectl get pods -n postgres -w
+# Press Ctrl+C when Running
+
+# Check logs
+kubectl logs -n postgres postgres-0 --tail=30
+```
+
+---
+
+## 3. Deploy FastAPI
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p fastapi-service/{app,k8s}
+cd fastapi-service
+```
+
+### Create all files from previous response:
+- `app/main.py`
+- `requirements.txt`
+- `Dockerfile`
+- `k8s/fastapi-all.yaml`
+
+**Quick creation:**
+```bash
+# app/main.py
+cat > app/main.py <<'EOF'
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+from starlette.responses import Response
+import time
+
+app = FastAPI(title="FastAPI Service", version="1.0.0", root_path="/fastapi")
+
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+REQUEST_COUNT = Counter('http_requests_total', 'Total requests', ['method', 'endpoint', 'status'])
+
+@app.middleware("http")
+async def add_metrics(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    REQUEST_COUNT.labels(request.method, request.url.path, response.status_code).inc()
+    return response
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": "fastapi"}
+
+@app.get("/ready")
+def ready():
+    return {"status": "ready"}
+
+@app.get("/metrics")
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.get("/api/v1/items")
+def list_items():
+    return {"items": [{"id": 1, "name": "FastAPI Item One"}, {"id": 2, "name": "FastAPI Item Two"}]}
+EOF
+
+# requirements.txt
+cat > requirements.txt <<'EOF'
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+prometheus-client==0.19.0
+EOF
+
+# Dockerfile - use heredoc for multi-line
+cat > Dockerfile <<'EOF'
+FROM python:3.11-slim AS builder
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --user --no-cache-dir -r requirements.txt
+
+FROM python:3.11-slim
+RUN useradd -m -u 1000 appuser && \
+    apt-get update && apt-get install -y --no-install-recommends curl && \
+    rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=builder /root/.local /home/appuser/.local
+COPY app/ ./app/
+USER appuser
+ENV PATH=/home/appuser/.local/bin:$PATH
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+EOF
+```
+
+Copy the `k8s/fastapi-all.yaml` from my previous response, then:
+
+```bash
+docker build -t localhost:5000/fastapi:latest .
+docker push localhost:5000/fastapi:latest
+
+kubectl apply -f k8s/fastapi-all.yaml
+
+kubectl get pods -n fastapi -w
+```
+
+---
+
+## 4. Deploy Django
+
+```bash
+cd ~/Documents/cloud_native/k8s-apps
+mkdir -p django-service
+cd django-service
+```
+
+Follow the full Django setup from my previous message. Key steps:
+
+1. Create venv and install packages
+2. Run `django-admin startproject config app/`
+3. Create `app/api/` 
+4. Modify `settings.py`, create `urls_custom.py`, `api/urls.py`, `api/views.py`
+5. Create `Dockerfile`, `requirements.txt`, `k8s/django-all.yaml`
+6. Build and deploy
+
+**After creating all files:**
+```bash
+docker build -t localhost:5000/django:latest .
+docker push localhost:5000/django:latest
+
+kubectl apply -f k8s/django-all.yaml
+
+kubectl get pods -n django -w
+```
+
+---
+
+## 5. Quick Test
+
+```bash
+# FastAPI health
+kubectl run test-fastapi --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -s http://fastapi-svc.fastapi.svc.cluster.local:8000/health
+
+# Django health + DB
+kubectl run test-django --image=curlimages/curl:latest --rm -it --restart=Never -- \
+  curl -s http://django-svc.django.svc.cluster.local:8000/ready/
+```
+
+---
+
+## Next 3 Steps
+
+1. **Send me status check:**
+```bash
+kubectl get pods -A
+kubectl top nodes  # Should work now
+kubectl logs -n postgres postgres-0 --tail=10
+kubectl logs -n django -l app=django --tail=20
+kubectl logs -n fastapi -l app=fastapi --tail=20
+```
+
+2. **Install Ingress** to expose services externally
+
+3. **Add monitoring** (Prometheus/Grafana)
+
+**If any pods fail, send:** `kubectl describe pod <pod-name> -n <namespace>`
